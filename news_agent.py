@@ -1,8 +1,7 @@
 """
 Daily News Agent
-- Calls Claude (with web_search) to source news across Global + India,
-  5 categories each, 3 items per category.
-- Formats each item as: Fact -> Context -> Consequence (beginner-friendly).
+- Calls Claude (with web_search) to source India news: Biotechnology + Politics, 3 stories each.
+- Claude writes the newspaper-style HTML directly (Fact -> Context -> Consequence per story).
 - Emails the digest via Gmail SMTP.
 """
 
@@ -21,19 +20,38 @@ import anthropic
 CATEGORIES = ["Biotechnology", "Politics"]
 MODEL = "claude-sonnet-5"
 
-SYSTEM_PROMPT = """Use web_search to find real news from the last 24-48 hours. \
-For each item write: FACT (1 sentence, what happened), CONTEXT (1-2 sentences, background \
-a beginner needs, plain language, no jargon), CONSEQUENCE (1 sentence, what happens next). \
-Only real news you found via search. Return ONLY this JSON, no other text:
+SYSTEM_PROMPT = """You are a newspaper editor. Use web_search to find real India news from the \
+last 24-48 hours across two sections: Biotechnology and Politics (3 stories each).
 
-{"biotechnology": [{"headline":"...","fact":"...","context":"...","consequence":"...","source_url":"..."}], "politics": [...]}
+For each story write three short parts, in plain language a complete beginner can follow, \
+no unexplained jargon:
+- What happened (1 sentence)
+- Background/context (1-2 sentences) - why it matters, what led here
+- What's next (1 sentence) - the likely consequence or what to watch
 
-Exactly 3 items per category."""
+Return a complete, self-contained HTML snippet (no <html>/<head>/<body> tags, just the \
+content) styled like a clean newspaper section, using this exact structure per story:
 
-USER_PROMPT = """Top India Biotechnology and Politics news today ({date}). 3 items each. JSON only."""
+<div style="margin-bottom:18px; padding-bottom:18px; border-bottom:1px solid #ddd;">
+  <div style="font-weight:700; font-size:16px; color:#111; margin-bottom:6px;">HEADLINE</div>
+  <div style="font-size:13px; color:#333; margin-bottom:4px;">WHAT HAPPENED sentence.</div>
+  <div style="font-size:13px; color:#333; margin-bottom:4px;">CONTEXT sentences.</div>
+  <div style="font-size:13px; color:#333; margin-bottom:4px;"><em>What's next:</em> CONSEQUENCE sentence.</div>
+  <div style="font-size:11px; margin-top:4px;"><a href="SOURCE_URL" style="color:#2563eb;">Source</a></div>
+</div>
+
+Precede each section with: <h2 style="font-size:20px; color:#111; border-bottom:2px solid #111; padding-bottom:6px;">SECTION NAME</h2>
+
+Return ONLY the HTML. No markdown fences, no explanation, no preamble or closing remarks."""
+
+USER_PROMPT = """Write today's ({date}) India news digest: Biotechnology and Politics, \
+3 stories each, per the format and rules given."""
 
 
-def get_region_news(client, today):
+def get_news_html():
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    today = datetime.now().strftime("%A, %B %d, %Y")
+
     response = client.messages.create(
         model=MODEL,
         max_tokens=3000,
@@ -43,62 +61,22 @@ def get_region_news(client, today):
     )
 
     text_parts = [block.text for block in response.content if block.type == "text"]
-    full_text = "\n".join(text_parts).strip()
+    html = "\n".join(text_parts).strip()
 
     # Strip accidental markdown fences just in case
-    full_text = re.sub(r"^```json\s*|\s*```$", "", full_text.strip())
+    html = re.sub(r"^```html\s*|^```\s*|\s*```$", "", html.strip())
 
-    # If the model appended stray text after the JSON object, isolate the object itself
-    start = full_text.find("{")
-    end = full_text.rfind("}")
-    if start != -1 and end != -1:
-        full_text = full_text[start:end + 1]
-
-    return json.loads(full_text)
-
-
-def get_news():
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    today = datetime.now().strftime("%A, %B %d, %Y")
-
-    return {"india": get_region_news(client, today)}
-
-
-def format_item_html(item):
-    return f"""
-    <div style="margin-bottom:16px; padding-bottom:16px; border-bottom:1px solid #e5e5e5;">
-      <div style="font-weight:600; font-size:15px; color:#111; margin-bottom:6px;">{item['headline']}</div>
-      <div style="font-size:13px; color:#333; margin-bottom:4px;"><strong>What happened:</strong> {item['fact']}</div>
-      <div style="font-size:13px; color:#333; margin-bottom:4px;"><strong>Context:</strong> {item['context']}</div>
-      <div style="font-size:13px; color:#333; margin-bottom:4px;"><strong>What to watch:</strong> {item['consequence']}</div>
-      <div style="font-size:11px;"><a href="{item.get('source_url','#')}" style="color:#2563eb;">Source</a></div>
-    </div>
-    """
-
-
-def format_region_html(region_data):
-    cat_labels = {
-        "biotechnology": "Biotechnology",
-        "politics": "Politics",
-    }
-    html = ""
-    for key, label in cat_labels.items():
-        items = region_data.get(key, [])
-        if not items:
-            continue
-        html += f'<h3 style="font-size:16px; color:#444; margin-top:20px;">{label}</h3>'
-        for item in items:
-            html += format_item_html(item)
     return html
 
 
-def build_email_html(news_json):
+def build_email_html(news_html):
     today = datetime.now().strftime("%A, %B %d, %Y")
-    body = f'<div style="font-family: -apple-system, Arial, sans-serif; max-width:640px; margin:0 auto;">'
-    body += f'<h1 style="font-size:22px; color:#111;">India Daily Digest — {today}</h1>'
-    body += format_region_html(news_json.get("india", {}))
-    body += "</div>"
-    return body
+    return f"""
+    <div style="font-family: -apple-system, Arial, sans-serif; max-width:640px; margin:0 auto;">
+      <h1 style="font-size:22px; color:#111;">India Daily Digest — {today}</h1>
+      {news_html}
+    </div>
+    """
 
 
 def send_email(html_body):
@@ -118,8 +96,8 @@ def send_email(html_body):
 
 
 def main():
-    news_json = get_news()
-    html_body = build_email_html(news_json)
+    news_html = get_news_html()
+    html_body = build_email_html(news_html)
     send_email(html_body)
     print("Digest sent successfully.")
 
