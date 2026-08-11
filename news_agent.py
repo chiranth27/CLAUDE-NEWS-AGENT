@@ -1,27 +1,31 @@
 """
 Daily News Agent
-- Calls Claude (with web_search) to source India news: Biotechnology + Politics, 3 stories each.
-- Claude writes the newspaper-style HTML directly (Fact -> Context -> Consequence per story).
+- Calls Gemini (with built-in Google Search grounding) to source news across
+  Global + India, 5 categories each (Technology, Biotechnology, Finance,
+  Trade & Economics, Politics), 3 stories per category.
+- Gemini writes the newspaper-style HTML directly (Fact -> Context -> Consequence per story).
 - Emails the digest via Gmail SMTP.
 """
 
 import os
-import json
-import smtplib
 import re
+import smtplib
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-import anthropic
+from google import genai
+from google.genai import types
 
 # ---------- Config ----------
 
-CATEGORIES = ["Biotechnology", "Politics"]
-MODEL = "claude-sonnet-5"
+CATEGORIES = ["Technology", "Biotechnology", "Finance", "Trade & Economics", "Politics"]
+REGIONS = ["Global", "India"]
+MODEL = "gemini-flash-latest"
 
-SYSTEM_PROMPT = """You are a newspaper editor. Use web_search to find real India news from the \
-last 24-48 hours across two sections: Biotechnology and Politics (3 stories each).
+SYSTEM_PROMPT = """You are a newspaper editor. Use Google Search to find real news from the \
+last 24-48 hours for ONE region at a time, across five sections: Technology, Biotechnology, \
+Finance, Trade & Economics, and Politics (3 stories each).
 
 For each story write three short parts, in plain language a complete beginner can follow, \
 no unexplained jargon:
@@ -40,40 +44,60 @@ content) styled like a clean newspaper section, using this exact structure per s
   <div style="font-size:11px; margin-top:4px;"><a href="SOURCE_URL" style="color:#2563eb;">Source</a></div>
 </div>
 
-Precede each section with: <h2 style="font-size:20px; color:#111; border-bottom:2px solid #111; padding-bottom:6px;">SECTION NAME</h2>
+Precede each of the 5 sections with: <h3 style="font-size:16px; color:#444; margin-top:20px;">SECTION NAME</h3>
 
 Return ONLY the HTML. No markdown fences, no explanation, no preamble or closing remarks."""
 
-USER_PROMPT = """Write today's ({date}) India news digest: Biotechnology and Politics, \
-3 stories each, per the format and rules given."""
+USER_PROMPT = """Write today's ({date}) {region} news digest across all 5 categories \
+(Technology, Biotechnology, Finance, Trade & Economics, Politics), 3 stories each, per the \
+format and rules given. {region_note}"""
+
+REGION_NOTES = {
+    "Global": "Cover the most important world news across these categories (any country).",
+    "India": "Cover India-specific news only across these categories.",
+}
+
+
+def get_region_html(client, region, today):
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=USER_PROMPT.format(date=today, region=region, region_note=REGION_NOTES[region]),
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+            max_output_tokens=4000,
+        ),
+    )
+
+    html = (response.text or "").strip()
+
+    # Strip accidental markdown fences just in case
+    html = re.sub(r"^```html\s*|^```\s*|\s*```$", "", html)
+
+    return html
 
 
 def get_news_html():
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
     today = datetime.now().strftime("%A, %B %d, %Y")
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=3000,
-        system=SYSTEM_PROMPT,
-        tools=[{"type": "web_search_20250305", "name": "web_search"}],
-        messages=[{"role": "user", "content": USER_PROMPT.format(date=today)}],
-    )
+    sections = []
+    for region in REGIONS:
+        region_html = get_region_html(client, region, today)
+        sections.append(
+            f'<h2 style="font-size:20px; color:#111; margin-top:32px; '
+            f'border-bottom:2px solid #111; padding-bottom:6px;">{region}</h2>'
+            f"{region_html}"
+        )
 
-    text_parts = [block.text for block in response.content if block.type == "text"]
-    html = "\n".join(text_parts).strip()
-
-    # Strip accidental markdown fences just in case
-    html = re.sub(r"^```html\s*|^```\s*|\s*```$", "", html.strip())
-
-    return html
+    return "\n".join(sections)
 
 
 def build_email_html(news_html):
     today = datetime.now().strftime("%A, %B %d, %Y")
     return f"""
     <div style="font-family: -apple-system, Arial, sans-serif; max-width:640px; margin:0 auto;">
-      <h1 style="font-size:22px; color:#111;">India Daily Digest — {today}</h1>
+      <h1 style="font-size:22px; color:#111;">Daily Digest — {today}</h1>
       {news_html}
     </div>
     """
